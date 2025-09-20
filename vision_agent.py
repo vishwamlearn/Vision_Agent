@@ -16,7 +16,6 @@ from autodistill_grounding_dino import GroundingDINO
 from autodistill.detection import CaptionOntology
 from dotenv import load_dotenv
 load_dotenv()
-# Recommended: os.environ["OPENAI_API_KEY"] = "YOUR_API_KEY"
 import os
 os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
 
@@ -28,6 +27,7 @@ class AgentState(TypedDict):
     user_request: str
     current_prompt: str
     final_image: np.ndarray
+    detected_labels: list[str]  # New key to store the labels
 
 # --- Define the Nodes ---
 def run_grounding_dino_node(state: AgentState):
@@ -35,9 +35,9 @@ def run_grounding_dino_node(state: AgentState):
     image_data = state['image_data']
     current_prompt = state['current_prompt']
 
-    # Convert bytes data from Gradio to a NumPy array for OpenCV
     nparr = np.frombuffer(image_data, np.uint8)
     image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    
     prompts = [p.strip() for p in current_prompt.split(',')]
     ontology_dict = {prompt: prompt for prompt in prompts}
     ontology = CaptionOntology(ontology_dict)
@@ -56,10 +56,9 @@ def run_grounding_dino_node(state: AgentState):
 
     annotated_image = sv.BoxAnnotator().annotate(scene=image.copy(), detections=detections)
     annotated_image_with_labels = sv.LabelAnnotator(
-    text_scale=3.5,  # Increase text size (default is 0.5)
-    text_thickness=2, # Increase text thickness (default is 1)
-    # You might also adjust text_color or text_padding if needed
-).annotate(
+        text_scale=3.5, 
+        text_thickness=2
+    ).annotate(
         scene=annotated_image,
         detections=detections,
         labels=labels
@@ -68,15 +67,16 @@ def run_grounding_dino_node(state: AgentState):
     _, buffer = cv2.imencode('.jpg', annotated_image_with_labels)
     base64_image = base64.b64encode(buffer).decode('utf-8')
 
-    print(f"GroundingDINO ran with prompt: '{current_prompt}'")
+    print(f"GroundingDINO ran with prompts: '{current_prompt}'")
 
-    # Update state with the final image and pass the base64 string for the LLM
+    # Update state with the final image, base64 data, and the new labels list
     return {
         "messages": [HumanMessage(content=[
             {"type": "text", "text": "Here is the annotated image."},
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
         ])],
-        "final_image": annotated_image_with_labels
+        "final_image": annotated_image_with_labels,
+        "detected_labels": labels # Pass the detected labels to the state
     }
 
 def gpt4o_analysis_node(state: AgentState):
@@ -86,11 +86,16 @@ def gpt4o_analysis_node(state: AgentState):
     messages = state['messages']
     user_request = state['user_request']
     current_prompt = state['current_prompt']
+    detected_labels = state['detected_labels']
 
     vision_prompt = (
-        f"The user wants to find: '{user_request}'. I used the detection prompt "
-        f"'{current_prompt}' and the result is the annotated image provided. "
-        "Critique the results. Are all relevant objects found? Are there false positives? "
+        "The image contains bounding boxes labeled with a detected class and confidence to specific objects.\n"
+        "Your task is to identify the objects indicated by these bounding boxes and determine whether each detected object is relevant to the user's query.\n"
+        f"The user's initial request was: '{user_request}'. "
+        f"The current detection prompt is: '{current_prompt}'. "
+        f"The annotated image shows that the model detected the following objects: {', '.join(detected_labels)}. "
+        f"Critique the detection results. Does the list of detected objects completely and accurately fulfill the user's request? "
+        "Consider if there are any objects that were missed or if there are irrelevant or inaccurate detections. "
         "If the detection is satisfactory, respond with only the word 'SATISFIED'. "
         "If the detection needs improvement, provide a more refined, comma-separated detection prompt to improve the results."
     )
@@ -107,14 +112,12 @@ def gpt4o_analysis_node(state: AgentState):
     else:
         return {"current_prompt": response_text, "messages": [HumanMessage(content=response_text)]}
 
-# --- Define the Router ---
 def decide_to_continue(state: AgentState):
     """Router node to decide if the workflow should continue or end."""
     if state['current_prompt'] is None:
         return "end"
     else:
         return "run_grounding_dino"
-
 # --- Build the Graph ---
 workflow = StateGraph(AgentState)
 workflow.add_node("run_grounding_dino", run_grounding_dino_node)
@@ -129,7 +132,6 @@ app = workflow.compile()
 # --- Gradio Integration ---
 def process_image_and_request(image: np.ndarray, request: str):
     """Gradio-facing function to run the LangGraph agent."""
-    # Convert image (NumPy array) to bytes
     _, buffer = cv2.imencode('.jpg', image)
     image_bytes = buffer.tobytes()
 
@@ -137,12 +139,13 @@ def process_image_and_request(image: np.ndarray, request: str):
         "messages": [],
         "image_data": image_bytes,
         "user_request": request,
-        "current_prompt": request
+        "current_prompt": request,
+        "final_image": None, # Will be set in the first node
+        "detected_labels": [] # Will be set in the first node
     }
 
     final_state = app.invoke(initial_state)
 
-    # The final image is stored in the state after the graph completes
     return final_state['final_image']
 
 # Set up the Gradio interface
@@ -154,7 +157,7 @@ iface = gr.Interface(
     ],
     outputs=gr.Image(label="Annotated Image"),
     title="Let's see Image Detection Agent",
-    description="Upload an image and specify what to detect."
+    description="Upload an image and specify what to detect. The agent will use GPT-4o to refine its search until the detection is satisfactory."
 )
 
 if __name__ == "__main__":
