@@ -16,6 +16,7 @@ from autodistill.detection import CaptionOntology
 from dotenv import load_dotenv
 load_dotenv()
 import os
+os.environ["HF_TOKEN"] = os.getenv("HF_TOKEN")
 
 # Hugging Face imports for Gemma
 from transformers import AutoProcessor, AutoModelForCausalLM
@@ -31,6 +32,7 @@ class AgentState(TypedDict):
     user_request: str
     current_prompt: str
     final_image: np.ndarray
+    detected_labels: list[str]  # New key to store the labels
 
 # --- Load the Gemma 3 4B-IT model globally ---
 # This ensures the model is loaded once at the start, not on every call
@@ -81,10 +83,9 @@ def run_grounding_dino_node(state: AgentState):
 
     annotated_image = sv.BoxAnnotator().annotate(scene=image.copy(), detections=detections)
     annotated_image_with_labels = sv.LabelAnnotator(
-    text_scale=3.5,  # Increase text size (default is 0.5)
-    text_thickness=2, # Increase text thickness (default is 1)
-    # You might also adjust text_color or text_padding if needed
-).annotate(
+    text_scale=3.5, 
+    text_thickness=2, 
+    ).annotate(
         scene=annotated_image,
         detections=detections,
         labels=labels
@@ -93,14 +94,15 @@ def run_grounding_dino_node(state: AgentState):
     _, buffer = cv2.imencode('.jpg', annotated_image_with_labels)
     base64_image = base64.b64encode(buffer).decode('utf-8')
 
-    print(f"GroundingDINO ran with prompt: '{current_prompt}'")
+    print(f"GroundingDINO ran with prompts: '{current_prompt}'")
 
     return {
         "messages": [HumanMessage(content=[
             {"type": "text", "text": "Here is the annotated image."},
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
         ])],
-        "final_image": annotated_image_with_labels
+        "final_image": annotated_image_with_labels,
+        "detected_labels": labels # Pass the detected labels to the state
     }
 
 def gemma_analysis_node(state: AgentState):
@@ -111,14 +113,17 @@ def gemma_analysis_node(state: AgentState):
     image_data = state['image_data']
     user_request = state['user_request']
     current_prompt = state['current_prompt']
+    detected_labels = state['detected_labels']
     
     # Convert image bytes to a PIL Image object
     image_pil = Image.open(BytesIO(image_data))
 
     vision_prompt = (
-        f"The user wants to find: '{user_request}'. I used the detection prompt "
-        f"'{current_prompt}' and the result is the annotated image provided. "
-        "Critique the results. Are all relevant objects found? Are there false positives? "
+        f"The user's initial request was: '{user_request}'. "
+        f"The current detection prompt is: '{current_prompt}'. "
+        f"The annotated image shows that the model detected the following objects: {', '.join(detected_labels)}. "
+        f"Critique the detection results. Does the list of detected objects completely and accurately fulfill the user's request? "
+        "Consider if there are any objects that were missed or if there are irrelevant or inaccurate detections. "
         "If the detection is satisfactory, respond with only the word 'SATISFIED'. "
         "If the detection needs improvement, provide a more refined, comma-separated detection prompt to improve the results."
     )
@@ -131,16 +136,26 @@ def gemma_analysis_node(state: AgentState):
         ]}
     ]
 
-    input_tensors = gemma_processor(messages, return_tensors="pt").to(device)
+    input_tensors = gemma_processor.apply_chat_template(
+        messages, 
+        add_generation_prompt=True,
+        tokenize=True,
+        return_tensors="pt"
+    ).to(gemma_model.device)
+
     response_tokens = gemma_model.generate(**input_tensors, max_new_tokens=100)
     response_text = gemma_processor.decode(response_tokens[0], skip_special_tokens=True)
     
-    print(f"Gemma response: {response_text}")
+    # The Gemma chat template adds a turn. We need to parse out the model's response.
+    cleaned_response = response_text.split("model\n")[1].strip() if "model\n" in response_text else response_text
 
-    if "SATISFIED" in response_text.upper():
+    print(f"Gemma response: {cleaned_response}")
+
+    if "SATISFIED" in cleaned_response.upper():
         return {"current_prompt": None, "messages": [HumanMessage(content="SATISFIED")]}
     else:
-        return {"current_prompt": response_text, "messages": [HumanMessage(content=response_text)]}
+        return {"current_prompt": cleaned_response, "messages": [HumanMessage(content=cleaned_response)]}
+
 
 # --- Define the Router ---
 def decide_to_continue(state: AgentState):
